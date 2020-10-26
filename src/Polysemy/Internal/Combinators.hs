@@ -46,7 +46,7 @@ swap ~(a, b) = (b, a)
 
 firstOrder
     :: ((forall rInitial x. e (Sem rInitial) x ->
-         Tactical e (Sem rInitial) r x) -> t)
+         Tactical e (Sem rInitial) rIn r x) -> t)
     -> (forall rInitial x. e (Sem rInitial) x -> Sem r x)
     -> t
 firstOrder higher f = higher $ \(e :: e (Sem rInitial) x) ->
@@ -68,14 +68,13 @@ interpret
 interpret = firstOrder interpretH
 {-# INLINE interpret #-}
 
-
 ------------------------------------------------------------------------------
 -- | Like 'interpret', but for higher-order effects (ie. those which make use of
 -- the @m@ parameter.)
 --
 -- See the notes on 'Tactical' for how to use this function.
 interpretH
-    :: (∀ x rInitial . e (Sem rInitial) x -> Tactical e (Sem rInitial) r x)
+    :: (∀ x rInitial . e (Sem rInitial) x -> Tactical e (Sem rInitial) (e : r) r x)
        -- ^ A natural transformation from the handled effect to other effects
        -- already in 'Sem'.
     -> Sem (e ': r) a
@@ -84,7 +83,7 @@ interpretH f (Sem m) = m $ \u ->
   case decomp u of
     Left  x -> liftSem $ hoist (interpretH f) x
     Right (Weaving e s d y v) -> do
-      a <- runTactics s d v $ f e
+      a <- runTactics s d v (interpretH f) $ f e
       pure $ y a
 {-# INLINE interpretH #-}
 
@@ -154,15 +153,14 @@ lazilyStateful
 lazilyStateful f = interpretInLazyStateT $ \e -> LS.StateT $ fmap swap . f e
 {-# INLINE[3] lazilyStateful #-}
 
-
 ------------------------------------------------------------------------------
 -- | Like 'reinterpret', but for higher-order effects.
 --
 -- See the notes on 'Tactical' for how to use this function.
 reinterpretH
     :: forall e1 e2 r a
-     . (∀ rInitial x. e1 (Sem rInitial) x ->
-        Tactical e1 (Sem rInitial) (e2 ': r) x)
+     . (∀ rInitial x . e1 (Sem rInitial) x ->
+        Tactical e1 (Sem rInitial) (e1 : r) (e2 : r) x)
        -- ^ A natural transformation from the handled effect to the new effect.
     -> Sem (e1 ': r) a
     -> Sem (e2 ': r) a
@@ -170,7 +168,7 @@ reinterpretH f (Sem m) = Sem $ \k -> m $ \u ->
   case decompCoerce u of
     Left x  -> k $ hoist (reinterpretH f) $ x
     Right (Weaving e s d y v) -> do
-      a <- usingSem k $ runTactics s (raiseUnder . d) v $ f e
+      a <- usingSem k (runTactics s (raiseUnder . d) v (reinterpretH f) $ f e)
       pure $ y a
 {-# INLINE[3] reinterpretH #-}
 -- TODO(sandy): Make this fuse in with 'stateful' directly.
@@ -200,7 +198,7 @@ reinterpret = firstOrder reinterpretH
 reinterpret2H
     :: forall e1 e2 e3 r a
      . (∀ rInitial x. e1 (Sem rInitial) x ->
-        Tactical e1 (Sem rInitial) (e2 ': e3 ': r) x)
+        Tactical e1 (Sem rInitial) (e1 : r) (e2 ': e3 ': r) x)
        -- ^ A natural transformation from the handled effect to the new effects.
     -> Sem (e1 ': r) a
     -> Sem (e2 ': e3 ': r) a
@@ -208,7 +206,7 @@ reinterpret2H f (Sem m) = Sem $ \k -> m $ \u ->
   case decompCoerce u of
     Left x  -> k $ weaken $ hoist (reinterpret2H f) $ x
     Right (Weaving e s d y v) -> do
-      a <- usingSem k $ runTactics s (raiseUnder2 . d) v $ f e
+      a <- usingSem k $ runTactics s (raiseUnder2 . d) v (reinterpret2H f) $ f e
       pure $ y a
 {-# INLINE[3] reinterpret2H #-}
 
@@ -234,7 +232,7 @@ reinterpret2 = firstOrder reinterpret2H
 reinterpret3H
     :: forall e1 e2 e3 e4 r a
      . (∀ rInitial x. e1 (Sem rInitial) x ->
-        Tactical e1 (Sem rInitial) (e2 ': e3 ': e4 ': r) x)
+        Tactical e1 (Sem rInitial) (e1 : r) (e2 ': e3 ': e4 ': r) x)
        -- ^ A natural transformation from the handled effect to the new effects.
     -> Sem (e1 ': r) a
     -> Sem (e2 ': e3 ': e4 ': r) a
@@ -242,7 +240,7 @@ reinterpret3H f (Sem m) = Sem $ \k -> m $ \u ->
   case decompCoerce u of
     Left x  -> k . weaken . weaken . hoist (reinterpret3H f) $ x
     Right (Weaving e s d y v) -> do
-      a <- usingSem k $ runTactics s (raiseUnder3 . d) v $ f e
+      a <- usingSem k $ runTactics s (raiseUnder3 . d) v (reinterpret3H f) $ f e
       pure $ y a
 {-# INLINE[3] reinterpret3H #-}
 
@@ -285,7 +283,7 @@ intercept f = interceptH $ \(e :: e (Sem rInitial) x) ->
 -- See the notes on 'Tactical' for how to use this function.
 interceptH
     :: Member e r
-    => (∀ x rInitial. e (Sem rInitial) x -> Tactical e (Sem rInitial) r x)
+    => (∀ x rInitial. e (Sem rInitial) x -> Tactical e (Sem rInitial) r r x)
        -- ^ A natural transformation from the handled effect to other effects
        -- already in 'Sem'.
     -> Sem r a
@@ -333,7 +331,7 @@ interceptUsingH
        -- ^ A proof that the handled effect exists in @r@.
        -- This can be retrieved through 'Polysemy.Membership.membership' or
        -- 'Polysemy.Membership.tryMembership'.
-    -> (∀ x rInitial. e (Sem rInitial) x -> Tactical e (Sem rInitial) r x)
+    -> (∀ x rInitial. e (Sem rInitial) x -> Tactical e (Sem rInitial) r r x)
        -- ^ A natural transformation from the handled effect to other effects
        -- already in 'Sem'.
     -> Sem r a
@@ -342,7 +340,7 @@ interceptUsingH
 interceptUsingH pr f (Sem m) = Sem $ \k -> m $ \u ->
   case prjUsing pr u of
     Just (Weaving e s d y v) ->
-      usingSem k $ y <$> runTactics s (raise . d) v (f e)
+      usingSem k $ y <$> runTactics s (raise . d) v (interceptUsingH pr f) (f e)
     Nothing -> k $ hoist (interceptUsingH pr f) u
 {-# INLINE interceptUsingH #-}
 

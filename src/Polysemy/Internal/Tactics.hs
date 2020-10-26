@@ -7,10 +7,13 @@ module Polysemy.Internal.Tactics
   , getInitialStateT
   , getInspectorT
   , Inspector (..)
+  , Interpreter (..)
   , runT
   , bindT
   , pureT
   , liftT
+  , interpretHO
+  , interpretBindHO
   , runTactics
   , Tactical
   , WithTactics
@@ -71,23 +74,24 @@ import Polysemy.Internal.Union
 --
 -- Power users may explicitly use 'getInitialStateT' and 'bindT' to construct
 -- whatever data flow they'd like; although this is usually unnecessary.
-type Tactical e m r x = ∀ f. Functor f
-                          => Sem (WithTactics e f m r) (f x)
+type Tactical e m rIn r x = ∀ f. Functor f
+                          => Sem (WithTactics e f m rIn r) (f x)
 
-type WithTactics e f m r = Tactics f m (e ': r) ': r
+type WithTactics e f m rIn r = Tactics e f m rIn r ': r
 
-data Tactics f n r m a where
-  GetInitialState     :: Tactics f n r m (f ())
-  HoistInterpretation :: (a -> n b) -> Tactics f n r m (f a -> Sem r (f b))
-  GetInspector        :: Tactics f n r m (Inspector f)
+data Tactics e f n rIn r m a where
+  GetInitialState     :: Tactics e f n rIn r m (f ())
+  HoistInterpretation :: (a -> n b) -> Tactics e f n rIn r m (f a -> Sem (e : r) (f b))
+  GetInspector        :: Tactics e f n rIn r m (Inspector f)
+  GetInterpreter      :: Tactics e f n rIn r m (Interpreter rIn r)
 
 
 ------------------------------------------------------------------------------
 -- | Get the stateful environment of the world at the moment the effect @e@ is
 -- to be run. Prefer 'pureT', 'runT' or 'bindT' instead of using this function
 -- directly.
-getInitialStateT :: forall f m r e. Sem (WithTactics e f m r) (f ())
-getInitialStateT = send @(Tactics _ m (e ': r)) GetInitialState
+getInitialStateT :: forall f m rIn r e. Sem (WithTactics e f m rIn r) (f ())
+getInitialStateT = send @(Tactics e _ m rIn r) GetInitialState
 
 
 ------------------------------------------------------------------------------
@@ -110,8 +114,14 @@ getInitialStateT = send @(Tactics _ m (e ': r)) GetInitialState
 -- let a = 'inspect' ins fa   -- Just "hello"
 --     b = 'inspect' ins fb   -- Just True
 -- @
-getInspectorT :: forall e f m r. Sem (WithTactics e f m r) (Inspector f)
-getInspectorT = send @(Tactics _ m (e ': r)) GetInspector
+getInspectorT :: forall e f m rIn r. Sem (WithTactics e f m rIn r) (Inspector f)
+getInspectorT = send @(Tactics e _ m rIn r) GetInspector
+
+
+------------------------------------------------------------------------------
+-- |Get the current interpreter.
+getInterpreterT :: forall e f m rIn r. Sem (WithTactics e f m rIn r) (Interpreter rIn r)
+getInterpreterT = send @(Tactics e f m rIn r) GetInterpreter
 
 
 ------------------------------------------------------------------------------
@@ -123,8 +133,16 @@ newtype Inspector f = Inspector
 
 
 ------------------------------------------------------------------------------
+-- | A container for 'interpreter'. See the documentation for 'getInterpreterT'.
+newtype Interpreter rIn r =
+  Interpreter {
+    interpreter :: ∀ x . Sem rIn x -> Sem r x
+  }
+
+
+------------------------------------------------------------------------------
 -- | Lift a value into 'Tactical'.
-pureT :: a -> Tactical e m r a
+pureT :: a -> Tactical e m rIn r a
 pureT a = do
   istate <- getInitialStateT
   pure $ a <$ istate
@@ -138,7 +156,7 @@ runT
     :: m a
       -- ^ The monadic action to lift. This is usually a parameter in your
       -- effect.
-    -> Sem (WithTactics e f m r)
+    -> Sem (WithTactics e f m rIn r)
                 (Sem (e ': r) (f a))
 runT na = do
   istate <- getInitialStateT
@@ -152,15 +170,16 @@ runT na = do
 -- 'bindT' to get an effect parameter of the form @a -> m b@ into something
 -- that can be used after calling 'runT' on an effect parameter @m a@.
 bindT
-    :: (a -> m b)
+    :: ∀ e f m rIn r a b
+    . (a -> m b)
        -- ^ The monadic continuation to lift. This is usually a parameter in
        -- your effect.
        --
        -- Continuations lifted via 'bindT' will run in the same environment
        -- which produced the @a@.
-    -> Sem (WithTactics e f m r)
+    -> Sem (WithTactics e f m rIn r)
                 (f a -> Sem (e ': r) (f b))
-bindT f = send $ HoistInterpretation f
+bindT f = send @(Tactics e _ m rIn r) $ HoistInterpretation f
 {-# INLINE bindT #-}
 
 
@@ -168,10 +187,10 @@ bindT f = send $ HoistInterpretation f
 -- | Internal function to create first-order interpreter combinators out of
 -- higher-order ones.
 liftT
-    :: forall m f r e a
+    :: forall m f rIn r e a
      . Functor f
     => Sem r a
-    -> Sem (WithTactics e f m r) (f a)
+    -> Sem (WithTactics e f m rIn r) (f a)
 liftT m = do
   a <- raise m
   pureT a
@@ -179,22 +198,52 @@ liftT m = do
 
 
 ------------------------------------------------------------------------------
+-- | Run the current interpreter on a higher-order Sem embedded in an effect
+-- constructor and lift the result into Tactics.
+interpretHO ::
+  m a ->
+  Tactical e m (e : r) r a
+interpretHO ma = do
+  Interpreter int <- getInterpreterT
+  raise . int =<< runT ma
+{-# INLINE interpretHO #-}
+
+
+------------------------------------------------------------------------------
+-- | Run the current interpreter on a higher-order Kleisli action embedded
+-- in an effect constructor and lift the result into Tactics.
+interpretBindHO ::
+  (a -> m b) ->
+  f a ->
+  Sem (WithTactics e f m (e : r) r) (f b)
+interpretBindHO fma fa = do
+  Interpreter int <- getInterpreterT
+  fmaT <- bindT fma
+  raise $ int (fmaT fa)
+{-# INLINE interpretBindHO #-}
+
+
+------------------------------------------------------------------------------
 -- | Run the 'Tactics' effect.
 runTactics
-   :: Functor f
+   :: ∀ e f m rIn r a
+   . Functor f
    => f ()
-   -> (∀ x. f (m x) -> Sem r2 (f x))
+   -> (∀ x. f (m x) -> Sem (e : r) (f x))
    -> (∀ x. f x -> Maybe x)
-   -> Sem (Tactics f m r2 ': r) a
+   -> (∀ x . Sem rIn x -> Sem r x)
+   -> Sem (Tactics e f m rIn r ': r) a
    -> Sem r a
-runTactics s d v (Sem m) = m $ \u ->
+runTactics s d v int (Sem m) = m $ \u ->
   case decomp u of
-    Left x -> liftSem $ hoist (runTactics s d v) x
+    Left x -> liftSem $ hoist (runTactics s d v int) x
     Right (Weaving GetInitialState s' _ y _) ->
       pure $ y $ s <$ s'
-    Right (Weaving (HoistInterpretation na) s' _ y _) -> do
+    Right (Weaving (HoistInterpretation na) s' _ y _) ->
       pure $ y $ (d . fmap na) <$ s'
-    Right (Weaving GetInspector s' _ y _) -> do
+    Right (Weaving GetInspector s' _ y _) ->
       pure $ y $ Inspector v <$ s'
+    Right (Weaving GetInterpreter s' _ y _) ->
+      pure $ y $ Interpreter int <$ s'
 {-# INLINE runTactics #-}
 
